@@ -2,235 +2,103 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
-	"strconv"
 	"strings"
 
 	"buf.build/go/bufplugin/check"
+	"buf.build/go/bufplugin/check/checkutil"
 	"buf.build/go/bufplugin/descriptor"
-	"buf.build/go/bufplugin/option"
+	"buf.build/go/bufplugin/info"
 	"github.com/googleapis/api-linter/lint"
 	"github.com/googleapis/api-linter/rules"
 	"github.com/jhump/protoreflect/desc"
 	"google.golang.org/protobuf/reflect/protoreflect"
-	"gopkg.in/yaml.v3"
 )
 
-const (
-	aipCategoryID        = "AIP"
-	aipCoreCategoryID    = "AIP_CORE"
-	aipClientLibrariesID = "AIP_CLIENT_LIBRARIES"
-)
-
-type fileDescriptorsContextKey struct{}
-
-const configOptionKey = "config_file"
-
-var config *lint.Configs
+var allCategory = "AIP"
 
 func main() {
-	spec, err := newSpec()
+	spec, err := buildSpec()
 	if err != nil {
-		log.Fatalln(err)
+		log.Fatalf("failed to build buf plugin spec: %v", err)
 	}
-	// AIP rules cannot be run in parallel as there is thread-unsafe code in
-	// this repository that causes concurrent read and write access to a map.
-	check.Main(spec, check.MainWithParallelism(1))
+	check.Main(spec)
 }
 
-func newSpec() (*check.Spec, error) {
+// buildSpec creates the buf plugin config
+func buildSpec() (*check.Spec, error) {
+	spec := &check.Spec{
+		Rules: []*check.RuleSpec{},
+		Categories: []*check.CategorySpec{
+			{ID: allCategory, Purpose: "Checks all Google api-linter rules."},
+		},
+		Info: &info.Spec{
+			Documentation: `A linting plugin that checks Google AIP conformance via the api-linter project`,
+			SPDXLicenseID: "apache-2.0",
+			LicenseURL:    "https://github.com/googleapis/api-linter/blob/main/LICENSE",
+		},
+	}
+	// add all rules. buf.yaml specifies which to enable/disable via ID
 	ruleRegistry := lint.NewRuleRegistry()
 	if err := rules.Add(ruleRegistry); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error when registering lint rules: %w", err)
 	}
-	ruleSpecs := make([]*check.RuleSpec, 0, len(ruleRegistry))
-	for _, protoRule := range ruleRegistry {
-		ruleSpec, err := newRuleSpec(protoRule)
-		if err != nil {
-			return nil, err
-		}
-		ruleSpecs = append(ruleSpecs, ruleSpec)
-	}
-	return &check.Spec{
-		Rules: ruleSpecs,
-		Categories: []*check.CategorySpec{
-			{
-				ID:      aipCategoryID,
-				Purpose: "Checks all API Enhancement proposals as specified at https://aip.dev.",
-			},
-			{
-				ID:      aipCoreCategoryID,
-				Purpose: "Checks all core API Enhancement proposals as specified at https://aip.dev.",
-			},
-			{
-				ID:      aipClientLibrariesID,
-				Purpose: "Checks all client library API Enhancement proposals as specified at https://aip.dev.",
-			},
-		},
-		Before: before,
-	}, nil
-}
-
-func newRuleSpec(protoRule lint.ProtoRule) (*check.RuleSpec, error) {
-	ruleName := protoRule.GetName()
-	if !ruleName.IsValid() {
-		return nil, fmt.Errorf("lint.RuleName is invalid: %q", ruleName)
-	}
-
-	split := strings.Split(string(ruleName), "::")
-	if len(split) != 3 {
-		return nil, fmt.Errorf("unknown lint.RuleName format, expected three parts split by '::' : %q", ruleName)
-	}
-
-	categoryIDs := []string{aipCategoryID}
-	switch extraCategoryID := split[0]; extraCategoryID {
-	case "core":
-		categoryIDs = append(categoryIDs, aipCoreCategoryID)
-	case "client-libraries":
-		categoryIDs = append(categoryIDs, aipClientLibrariesID)
-	default:
-		return nil, fmt.Errorf("unknown lint.RuleName format: unknown category %q : %q", extraCategoryID, ruleName)
-	}
-
-	aipNumber, err := strconv.Atoi(split[1])
-	if err != nil {
-		return nil, fmt.Errorf("unknown lint.RuleName format, unknown aip %q : %q", split[1], ruleName)
-	}
-
-	spec := &check.RuleSpec{
-		ID:          getRuleID(string(ruleName)),
-		CategoryIDs: categoryIDs,
-		Default:     true,
-		Purpose:     fmt.Sprintf("Checks AIP rule %s.", ruleName),
-		Type:        check.RuleTypeLint,
-		Handler:     newRuleHandler(aipNumber, protoRule),
+	for _, rule := range ruleRegistry {
+		spec.Rules = append(spec.Rules, ruleToBufRule(rule))
 	}
 	return spec, nil
 }
 
-func getRuleID(name string) string {
-	// The allowed characters for RuleName are a-z, 0-9, -.
-	// The separator :: is also allowed.
-	// We do a translation of these into valid check.Rule IDs.
-	split := strings.Split(string(name), "::")
-	ruleID := "AIP_" + strings.Join(split[1:3], "_")
-	ruleID = strings.ReplaceAll(ruleID, "-", "_")
-	ruleID = strings.ToUpper(ruleID)
-	return ruleID
+// ruleNameToBufID sanitizes the rule names into a format accepted by buf
+func ruleNameToBufID(name lint.RuleName) string {
+	replacer := strings.NewReplacer("::", "_", "-", "_")
+	return "AIP_" + strings.ToUpper(replacer.Replace(string(name)))
 }
 
-func newRuleHandler(aip int, protoRule lint.ProtoRule) check.RuleHandler {
-	return check.RuleHandlerFunc(
-		func(ctx context.Context, responseWriter check.ResponseWriter, request check.Request) error {
-			configPath, err := option.GetStringValue(request.Options(), configOptionKey)
-			if err != nil {
-				return err
+// ruleToBufRule translate's our "rule" into the buf equivalant
+func ruleToBufRule(rule lint.ProtoRule) *check.RuleSpec {
+	handler := func(ctx context.Context, writer check.ResponseWriter, request check.Request, descriptor descriptor.FileDescriptor) error {
+		wrappedDescriptor, err := desc.WrapFile(descriptor.ProtoreflectFileDescriptor())
+		if err != nil {
+			return err
+		}
+		problems := rule.Lint(wrappedDescriptor)
+		for _, problem := range problems {
+			var unwrappedDescriptor protoreflect.Descriptor
+			switch d := problem.Descriptor.(type) {
+			case *desc.FieldDescriptor:
+				unwrappedDescriptor = d.Unwrap()
+			case *desc.FileDescriptor:
+				unwrappedDescriptor = d.Unwrap()
+			case *desc.EnumValueDescriptor:
+				unwrappedDescriptor = d.Unwrap()
+			case *desc.EnumDescriptor:
+				unwrappedDescriptor = d.Unwrap()
+			case *desc.MessageDescriptor:
+				unwrappedDescriptor = d.Unwrap()
+			case *desc.MethodDescriptor:
+				unwrappedDescriptor = d.Unwrap()
+			case *desc.OneOfDescriptor:
+				unwrappedDescriptor = d.Unwrap()
+			case *desc.ServiceDescriptor:
+				unwrappedDescriptor = d.Unwrap()
+			default:
+				return fmt.Errorf("unhandled type converting api-linter rule to buf rule: %T", d)
 			}
-
-			if config == nil {
-				if configPath == "" {
-					config = &lint.Configs{}
-				} else {
-					conf, err := lint.ReadConfigsFromFile(configPath)
-					if err != nil {
-						return err
-					}
-
-					config = &conf
-				}
-			}
-
-			ruleRegistry := lint.NewRuleRegistry()
-			ruleRegistry.Register(aip, protoRule)
-			linter := lint.New(ruleRegistry, *config)
-
-			fileDescriptors, _ := ctx.Value(fileDescriptorsContextKey{}).([]*desc.FileDescriptor)
-			responses, err := linter.LintProtos(fileDescriptors...)
-			if err != nil {
-				return err
-			}
-
-			for _, response := range responses {
-				for _, problem := range response.Problems {
-					if err := addProblem(responseWriter, problem); err != nil {
-						return err
-					}
-				}
-			}
-
-			return nil
-		},
-	)
-}
-
-func addProblem(responseWriter check.ResponseWriter, problem lint.Problem) error {
-	msg, err := yaml.Marshal(problem)
-	if err != nil {
-		return err
-	}
-
-	addAnnotationOptions := []check.AddAnnotationOption{
-		check.WithMessagef("%s: %s", getRuleID(string(problem.RuleID)), string(msg)),
-	}
-
-	descriptor := problem.Descriptor
-	if descriptor == nil {
-		// This should never happen.
-		return errors.New("got nil problem.Descriptor")
-	}
-
-	fileDescriptor := descriptor.GetFile()
-	if fileDescriptor == nil {
-		// If we do not have a FileDescriptor, we cannot report a location.
-		responseWriter.AddAnnotation(addAnnotationOptions...)
-		return nil
-	}
-	// If a location is available from the problem, we use that directly.
-	if location := problem.Location; location != nil {
-		addAnnotationOptions = append(
-			addAnnotationOptions,
-			check.WithFileNameAndSourcePath(
-				fileDescriptor.GetName(),
-				protoreflect.SourcePath(location.GetPath()),
-			),
-		)
-	} else {
-		// Otherwise we check the source info for the descriptor from the problem.
-		if location := descriptor.GetSourceInfo(); location != nil {
-			addAnnotationOptions = append(
-				addAnnotationOptions,
-				check.WithFileNameAndSourcePath(
-					fileDescriptor.GetName(),
-					protoreflect.SourcePath(location.GetPath()),
-				),
+			writer.AddAnnotation(
+				check.WithMessage(problem.Message),
+				check.WithDescriptor(unwrappedDescriptor),
 			)
 		}
+		return nil
 	}
-	responseWriter.AddAnnotation(addAnnotationOptions...)
-	return nil
-}
-
-func before(ctx context.Context, request check.Request) (context.Context, check.Request, error) {
-	fileDescriptors, err := nonImportFileDescriptorsForFileDescriptors(request.FileDescriptors())
-	if err != nil {
-		return nil, nil, err
+	return &check.RuleSpec{
+		ID:          ruleNameToBufID(rule.GetName()),
+		CategoryIDs: []string{allCategory},
+		Type:        check.RuleTypeLint,
+		Purpose:     fmt.Sprintf("Validates Google AIP %s.", rule.GetName()),
+		Default:     true,
+		Handler:     checkutil.NewFileRuleHandler(handler, checkutil.WithoutImports()),
 	}
-	ctx = context.WithValue(ctx, fileDescriptorsContextKey{}, fileDescriptors)
-	return ctx, request, nil
-}
-
-func nonImportFileDescriptorsForFileDescriptors(fileDescriptors []descriptor.FileDescriptor) ([]*desc.FileDescriptor, error) {
-	if len(fileDescriptors) == 0 {
-		return nil, nil
-	}
-	reflectFileDescriptors := make([]protoreflect.FileDescriptor, 0, len(fileDescriptors))
-	for _, fileDescriptor := range fileDescriptors {
-		if fileDescriptor.IsImport() {
-			continue
-		}
-		reflectFileDescriptors = append(reflectFileDescriptors, fileDescriptor.ProtoreflectFileDescriptor())
-	}
-	return desc.WrapFiles(reflectFileDescriptors)
 }
